@@ -20,13 +20,15 @@ package main
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"os"
+	"path"
 	godebug "runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-
+	
 	"github.com/elastic/gosigar"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
@@ -41,10 +43,31 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/node"
 	cli "gopkg.in/urfave/cli.v1"
+	
+	"sync"
+	"github.com/manifoldco/promptui"
+	demo "github.com/novalex/orderbook/common"
+	"github.com/novalex/orderbook/orderbook"
+	"github.com/novalex/orderbook/protocol"
+	"github.com/novalex/orderbook/terminal"
 )
 
 const (
 	clientIdentifier = "geth" // Client identifier to advertise over the network
+)
+
+// command line arguments
+var (
+	thisNode *node.Node
+	// struct{} is the smallest data type available in Go, since it contains literally nothing
+	quitC   = make(chan struct{}, 1)	
+
+	// get the incoming message
+	msgC = make(chan interface{})
+	orderbookDebug  = true
+	prompt          *promptui.Select
+	commands        []terminal.Command	
+	orderbookEngine *orderbook.Engine	
 )
 
 var (
@@ -299,16 +322,236 @@ func geth(ctx *cli.Context) error {
 	}
 	node := makeFullNode(ctx)
 	defer node.Close()
+
+	thisNode = node
+	initPrompt()
+	initOrderbook()
+
 	startNode(ctx, node)
+
+	startOrderbook()
+
 	node.Wait()
 	return nil
 }
+
+/** orderbook code **/
+
+func shutdown() error {
+	// return os.RemoveAll(thisNode.DataDir())
+	return nil
+}
+
+func initPrompt() {
+
+	cancelOrderArguments := []terminal.Argument{
+		{Name: "order_id", Value: "1"},
+		{Name: "pair_name", Value: "TOMO/WETH"},
+		{Name: "side", Value: orderbook.Ask},
+		{Name: "price", Value: "100"},
+	}
+
+	orderArguments := []terminal.Argument{
+		{Name: "pair_name", Value: "TOMO/WETH"},
+		{Name: "type", Value: "limit"},
+		{Name: "side", Value: orderbook.Ask},
+		{Name: "quantity", Value: "10"},
+		{Name: "price", Value: "100", Hide: func(results map[string]string, thisArgument *terminal.Argument) bool {
+			// ignore this argument when order type is market
+			if results["type"] == "market" {
+				return true
+			}
+			return false
+		}},
+		{Name: "trade_id", Value: "1"},
+	}
+
+	updateOrderArguments := append([]terminal.Argument{
+		{Name: "order_id", Value: "1"},
+	}, orderArguments...)
+
+	// init prompt commands
+	commands = []terminal.Command{
+		{
+			Name:        "addOrder",
+			Arguments:   orderArguments,
+			Description: "Add order",
+		},
+		{
+			Name:        "updateOrder",
+			Arguments:   updateOrderArguments,
+			Description: "Update order, order_id must greater than 0",
+		},
+		{
+			Name:        "cancelOrder",
+			Arguments:   cancelOrderArguments,
+			Description: "Cancel order, order_id must greater than 0",
+		},
+		{
+			Name:        "nodeAddr",
+			Description: "Get Node address",
+		},
+		{
+			Name:        "quit",
+			Description: "Quit the program",
+		},
+	}
+
+	// cast type to sort
+	// sort.Sort(terminal.CommandsByName(commands))
+
+	prompt = terminal.NewPrompt("Your choice:", 6, commands)
+}
+
+func nodeAddr() string {
+	return thisNode.Server().Self().String()
+}
+
+func processOrder(payload map[string]string) error {
+	// add order at this current node first
+	// get timestamp in milliseconds
+	if payload["timestamp"] == "" {
+		payload["timestamp"] = strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
+	}
+	msg, err := protocol.NewOrderbookMsg(payload)
+	if err == nil {
+		// try to store into model, if success then process at local and broad cast
+		trades, orderInBook := orderbookEngine.ProcessOrder(payload)
+		demo.LogInfo("Orderbook result", "Trade", trades, "OrderInBook", orderInBook)
+
+		// broad cast message
+		msgC <- msg
+
+	}
+
+	return err
+}
+
+func cancelOrder(payload map[string]string) error {
+	// add order at this current node first
+	// get timestamp in milliseconds
+	payload["timestamp"] = strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
+	msg, err := protocol.NewOrderbookMsg(payload)
+	if err == nil {
+		// try to store into model, if success then process at local and broad cast
+		err := orderbookEngine.CancelOrder(payload)
+		demo.LogInfo("Orderbook cancel result", "err", err, "msg", msg)
+
+		// broad cast message
+		msgC <- msg
+
+	}
+
+	return err
+}
+
+// simple ping and receive protocol
+func initOrderbook() {
+
+	var err error
+	
+	orderbookDir := path.Join(thisNode.Config().DataDir, "orderbook")
+	allowedPairs := map[string]*big.Int{
+		"TOMO/WETH": big.NewInt(10e9),
+		"NOVA/WETH": big.NewInt(10e9),
+	}
+	orderbookEngine = orderbook.NewEngine(orderbookDir, allowedPairs)	
+
+	// register normal service, protocol is for p2p, service is for rpc calls
+	service := protocol.NewService(msgC, quitC, orderbookEngine)
+	err = thisNode.Register(service)
+
+	if err != nil {
+		demo.LogCrit("Register orderbook service in servicenode failed", "err", err)
+	}
+
+	if err != nil {
+		demo.LogCrit(err.Error())
+	}
+	
+}
+
+func startOrderbook() error {	
+
+	// process command
+	fmt.Println("---------------Welcome to Orderbook testing---------------------")
+
+	if orderbookDebug {
+
+		var endWaiter sync.WaitGroup
+		endWaiter.Add(1)
+
+		// start serving
+		go func() {
+
+			for {
+				// loop command
+				selected, _, err := prompt.Run()
+
+				// unknow error, should retry
+				if err != nil {
+					demo.LogInfo("Prompt failed %v\n", err)
+					continue
+				}
+
+				// get selected command and run it
+				command := commands[selected]
+				if command.Name == "quit" {
+					demo.LogInfo("Server quiting...")
+					// commit changes to orderbook
+					orderbookEngine.Commit()
+					endWaiter.Done()
+					thisNode.Stop()
+					quitC <- struct{}{}
+					demo.LogInfo("-> Goodbye\n")
+					return
+				}
+				results := command.Run()
+
+				// process command
+				switch command.Name {
+				case "addOrder":
+					demo.LogInfo("-> Add order", "payload", results)
+					// put message on channel
+					results["order_id"] = "0"
+					go processOrder(results)
+				case "updateOrder":
+					demo.LogInfo("-> Update order", "payload", results)
+					// put message on channel
+					go processOrder(results)
+				case "cancelOrder":
+					demo.LogInfo("-> Cancel order", "payload", results)
+					// put message on channel
+					go cancelOrder(results)
+
+				case "nodeAddr":
+					demo.LogInfo(fmt.Sprintf("-> Node Address: %s\n", nodeAddr()))
+
+				default:
+					demo.LogInfo(fmt.Sprintf("-> Unknown command: %s\n", command.Name))
+				}
+			}
+
+		}()
+
+		// wait for command processing
+		endWaiter.Wait()
+	} else {
+
+		demo.WaitForCtrlC()
+	}
+
+	// finally shutdown
+	return shutdown()
+}
+
+/** end orderbook code **/
 
 // startNode boots up the system node and all registered protocols, after which
 // it unlocks any requested accounts, and starts the RPC/IPC interfaces and the
 // miner.
 func startNode(ctx *cli.Context, stack *node.Node) {
-	debug.Memsize.Add("node", stack)
+	debug.Memsize.Add("node", stack)			
 
 	// Start up the node itself
 	utils.StartNode(stack)
